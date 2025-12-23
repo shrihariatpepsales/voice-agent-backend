@@ -86,9 +86,22 @@ All WebSocket messages use JSON format with a consistent structure:
 ```json
 {
   "type": "message_type",
-  "payload": {}
+  "payload": {},
+  "metadata": {}
 }
 ```
+
+When used from the browser client, the `metadata` object automatically includes a **tab‑scoped session identifier**:
+
+```json
+{
+  "metadata": {
+    "browser_session_id": "2e1f3f2a-2a1f-4e0f-9f4c-7a3c0d1e9b2c"
+  }
+}
+```
+
+This `browser_session_id` is stable across page refreshes within a tab and different for each browser tab/window.
 
 ### Client to Server Messages
 
@@ -242,7 +255,8 @@ All transcripts and LLM responses are automatically saved to `transcripts.jsonl`
 {
   "timestamp": "2025-12-22T13:15:02.599Z",
   "transcript": "User's spoken text",
-  "llm_response": "Agent's response text"
+  "llm_response": "Agent's response text",
+  "browser_session_id": "2e1f3f2a-2a1f-4e0f-9f4c-7a3c0d1e9b2c"
 }
 ```
 
@@ -252,7 +266,41 @@ All transcripts and LLM responses are automatically saved to `transcripts.jsonl`
 - After LLM response completes successfully
 - After LLM error (with error message in `llm_response` field)
 
+**Session Tracking:**
+- `browser_session_id` comes from the `metadata.browser_session_id` field on incoming WebSocket messages.
+- It is **stable per browser tab/window** (persisted in `sessionStorage` on the frontend) and used to group all turns for that tab.
+
 **Format:** JSONL (JSON Lines) - each line is a valid JSON object, making it easy to append and parse
+
+## Session-Based Conversation History API
+
+The backend exposes a simple HTTP API to fetch all stored turns for a given `browser_session_id`. This is used by the frontend to restore chat history after a page refresh in the same browser tab.
+
+**Endpoint:**
+
+- `GET /api/conversations/:sessionId`
+
+**Path parameter:**
+
+- `sessionId` – the `browser_session_id` value for a given browser tab.
+
+**Response:**
+
+```json
+{
+  "session_id": "2e1f3f2a-2a1f-4e0f-9f4c-7a3c0d1e9b2c",
+  "entries": [
+    {
+      "timestamp": "2025-12-22T13:15:02.599Z",
+      "transcript": "User's spoken text",
+      "llm_response": "Agent's response text",
+      "browser_session_id": "2e1f3f2a-2a1f-4e0f-9f4c-7a3c0d1e9b2c"
+    }
+  ]
+}
+```
+
+If no entries are found for the given session, `entries` will be an empty array.
 
 ## Deepgram Integration
 

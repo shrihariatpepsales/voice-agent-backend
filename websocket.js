@@ -29,6 +29,7 @@ function initWebSocketServer(server) {
     let currentTTSStream = null;
     let deepgramStream = null;
     let conversationHistory = [];
+    let browserSessionId = null;
     let isRecording = false;
     
     // Silence detection for transcript finalization
@@ -52,7 +53,7 @@ function initWebSocketServer(server) {
       }
     }
 
-    function saveTranscriptToFile(transcript, llmResponse) {
+    function saveTranscriptToFile(transcript, llmResponse, sessionId) {
       try {
         const timestamp = new Date().toISOString();
         const filePath = path.join(__dirname, 'transcripts.jsonl');
@@ -60,7 +61,8 @@ function initWebSocketServer(server) {
         const entry = {
           timestamp,
           transcript,
-          llm_response: llmResponse
+          llm_response: llmResponse,
+          browser_session_id: sessionId || null,
         };
         
         // Append to file (JSONL format - one JSON object per line)
@@ -137,8 +139,8 @@ function initWebSocketServer(server) {
           // Add assistant response to conversation history
           conversationHistory.push({ role: 'assistant', content: fullResponse });
 
-          // Save message and LLM response to file
-          saveTranscriptToFile(messageText, fullResponse);
+          // Save message and LLM response to file with session id
+          saveTranscriptToFile(messageText, fullResponse, browserSessionId);
 
           // Update status based on mode
           if (isChatMode) {
@@ -167,7 +169,7 @@ function initWebSocketServer(server) {
 
           // Save message with error response
           const errorResponse = `Error: ${err.message}`;
-          saveTranscriptToFile(messageText, errorResponse);
+          saveTranscriptToFile(messageText, errorResponse, browserSessionId);
 
           sendMessage('status', { state: 'error', error: 'llm_error' });
           currentLLMStream = null;
@@ -708,8 +710,8 @@ function initWebSocketServer(server) {
           llmResponseForFile = fullText;
           conversationHistory.push({ role: 'assistant', content: fullText });
 
-          // Save transcript and LLM response to file
-          saveTranscriptToFile(transcriptForFile, fullText);
+          // Save transcript and LLM response to file with session id
+          saveTranscriptToFile(transcriptForFile, fullText, browserSessionId);
 
           // Start TTS streaming for the final assistant text
           sendMessage('status', { state: 'speaking' });
@@ -730,7 +732,7 @@ function initWebSocketServer(server) {
           
           // Save transcript with error message
           const errorResponse = `Error: ${err.message}`;
-          saveTranscriptToFile(transcriptForFile, errorResponse);
+          saveTranscriptToFile(transcriptForFile, errorResponse, browserSessionId);
           
           sendMessage('status', { state: 'error', error: 'llm_error' });
         },
@@ -769,7 +771,11 @@ function initWebSocketServer(server) {
           parsed = JSON.parse(data.toString());
         }
 
-        const { type, payload } = parsed;
+        const { type, payload, metadata } = parsed;
+
+        if (metadata && metadata.browser_session_id && !browserSessionId) {
+          browserSessionId = String(metadata.browser_session_id);
+        }
 
         switch (type) {
           case 'start_recording': {
