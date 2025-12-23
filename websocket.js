@@ -7,6 +7,7 @@ const { connectToDatabase } = require('./db');
 const Session = require('./models/Session');
 const ConversationEntry = require('./models/ConversationEntry');
 const Booking = require('./models/Booking');
+const { sendAppointmentConfirmationEmail } = require('./services/emailService');
 
 function log(context, message, extra = {}) {
   const timestamp = new Date().toISOString();
@@ -141,7 +142,13 @@ function initWebSocketServer(server) {
       return false;
     }
 
-    async function createBookingFromPayload(bookingAction) {
+    /**
+     * Create a booking from the booking action payload
+     * @param {Object} bookingAction - The booking action object with payload
+     * @param {Function} onEmailSuccess - Optional callback called when email is sent successfully
+     * @returns {Promise<Object>} The created booking object
+     */
+    async function createBookingFromPayload(bookingAction, onEmailSuccess = null) {
       const payload = bookingAction && bookingAction.payload ? bookingAction.payload : null;
       if (!payload) return null;
 
@@ -188,6 +195,38 @@ function initWebSocketServer(server) {
         hasUser: !!currentUserId,
         bookingId: booking._id.toString(),
       });
+
+      // Send confirmation email if email is provided
+      // This runs asynchronously and does not block the booking creation
+      if (email && typeof email === 'string' && email.trim().length > 0) {
+        // Convert booking document to plain object for email service
+        const bookingData = {
+          name: booking.name,
+          age: booking.age,
+          contactNumber: booking.contactNumber,
+          medicalConcern: booking.medicalConcern,
+          appointmentDateTime: booking.appointmentDateTime,
+          email: booking.email,
+          doctorPreference: booking.doctorPreference || null,
+        };
+
+        // Send email asynchronously - don't await to avoid blocking
+        sendAppointmentConfirmationEmail(bookingData)
+          .then(() => {
+            // Email sent successfully - call callback if provided
+            if (onEmailSuccess && typeof onEmailSuccess === 'function') {
+              onEmailSuccess();
+            }
+          })
+          .catch((emailError) => {
+            // Log email error but don't fail the booking
+            log('ws', 'email_send_failed', {
+              bookingId: booking._id.toString(),
+              email: email,
+              error: emailError.message,
+            });
+          });
+      }
 
       return booking;
     }
@@ -243,6 +282,19 @@ function initWebSocketServer(server) {
         messages: conversationHistory,
         onToken: (token) => {
           llmResponseText += token;
+          
+          // Check accumulated text for curly braces - if found, suppress entire response
+          if (containsCurlyBraces(llmResponseText)) {
+            // If we haven't already suppressed, clear what was already sent
+            if (!suppressBookingStreaming) {
+              suppressBookingStreaming = true;
+              // Clear any partial response that may have been sent
+              sendMessage('agent_text', { token: '', clear: true });
+            }
+            // Stop sending tokens - entire response contains curly braces
+            return;
+          }
+
           // If this looks like a booking JSON payload, suppress streaming to UI
           if (!suppressBookingStreaming && isLikelyBookingJson(llmResponseText)) {
             suppressBookingStreaming = true;
@@ -251,12 +303,10 @@ function initWebSocketServer(server) {
             return;
           }
 
+          // Only send tokens if we're not suppressing (no curly braces detected)
           if (!suppressBookingStreaming) {
-            // Filter out tokens containing curly braces to prevent JSON fragments from appearing
-            if (!containsCurlyBraces(token)) {
-              // Stream tokens to frontend in real-time
-              sendMessage('agent_text', { token });
-            }
+            // Stream tokens to frontend in real-time
+            sendMessage('agent_text', { token });
           }
         },
         onComplete: async (fullResponse) => {
@@ -276,7 +326,22 @@ function initWebSocketServer(server) {
               });
               sendMessage('status', { state: 'processing' });
 
-              const booking = await createBookingFromPayload(bookingAction);
+              // Check if email exists in payload to set up email success callback
+              const hasEmail = bookingAction.payload && 
+                               bookingAction.payload.email && 
+                               typeof bookingAction.payload.email === 'string' && 
+                               bookingAction.payload.email.trim().length > 0;
+
+              // Callback to send polite email confirmation message when email is sent successfully
+              // This sends a separate agent response (new message bubble)
+              const onEmailSuccess = () => {
+                const emailConfirmationText = 'I\'ve also sent a confirmation email to your email with all the appointment details. Please check your inbox.';
+                // Clear current agent text and start a new separate message
+                sendMessage('agent_text', { token: '', clear: true });
+                sendMessage('agent_text', { token: emailConfirmationText });
+              };
+
+              const booking = await createBookingFromPayload(bookingAction, hasEmail ? onEmailSuccess : null);
 
               // Clear progress text and send a friendly confirmation
               sendMessage('agent_text', { token: '', clear: true });
@@ -953,7 +1018,22 @@ function initWebSocketServer(server) {
               });
               sendMessage('status', { state: 'processing' });
 
-              const booking = await createBookingFromPayload(bookingAction);
+              // Check if email exists in payload to set up email success callback
+              const hasEmail = bookingAction.payload && 
+                               bookingAction.payload.email && 
+                               typeof bookingAction.payload.email === 'string' && 
+                               bookingAction.payload.email.trim().length > 0;
+
+              // Callback to send polite email confirmation message when email is sent successfully
+              // This sends a separate agent response (new message bubble)
+              const onEmailSuccess = () => {
+                const emailConfirmationText = 'I\'ve also sent a confirmation email to your email with all the appointment details. Please check your inbox.';
+                // Clear current agent text and start a new separate message
+                sendMessage('agent_text', { token: '', clear: true });
+                sendMessage('agent_text', { token: emailConfirmationText });
+              };
+
+              const booking = await createBookingFromPayload(bookingAction, hasEmail ? onEmailSuccess : null);
 
               sendMessage('agent_text', { token: '', clear: true });
 
