@@ -7,6 +7,7 @@ const authRoutes = require('./routes/auth');
 const { connectToDatabase } = require('./db');
 const ConversationEntry = require('./models/ConversationEntry');
 const Booking = require('./models/Booking');
+const { sendAppointmentConfirmationEmail } = require('./services/emailService');
 
 const { initWebSocketServer } = require('./websocket');
 
@@ -135,6 +136,31 @@ app.post('/book-appointment', async (req, res) => {
       doctorPreference,
       status: 'confirmed',
     });
+
+    // Send confirmation email if email is provided
+    // This runs asynchronously and does not block the API response
+    if (email && typeof email === 'string' && email.trim().length > 0) {
+      // Convert booking document to plain object for email service
+      const bookingData = {
+        name: booking.name,
+        age: booking.age,
+        contactNumber: booking.contactNumber,
+        medicalConcern: booking.medicalConcern,
+        appointmentDateTime: booking.appointmentDateTime,
+        email: booking.email,
+        doctorPreference: booking.doctorPreference || null,
+      };
+
+      // Send email asynchronously - don't await to avoid blocking the response
+      sendAppointmentConfirmationEmail(bookingData).catch((emailError) => {
+        // Log email error but don't fail the booking
+        console.error('[server] Failed to send confirmation email (booking still successful)', {
+          bookingId: booking._id.toString(),
+          email: email,
+          error: emailError.message,
+        });
+      });
+    }
 
     return res.status(200).json({
       success: true,
