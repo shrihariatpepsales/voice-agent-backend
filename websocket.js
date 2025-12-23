@@ -6,6 +6,7 @@ const { createTTSStream } = require('./services/tts');
 const { connectToDatabase } = require('./db');
 const Session = require('./models/Session');
 const ConversationEntry = require('./models/ConversationEntry');
+const Booking = require('./models/Booking');
 
 function log(context, message, extra = {}) {
   const timestamp = new Date().toISOString();
@@ -33,6 +34,7 @@ function initWebSocketServer(server) {
     let browserSessionId = null;
     let currentUserId = null;
     let isRecording = false;
+    let suppressBookingStreaming = false;
     
     // Silence detection for transcript finalization
     // Use transcript-based detection instead of audio-chunk-based
@@ -104,6 +106,83 @@ function initWebSocketServer(server) {
       }
     }
 
+    function parseBookingPayload(text) {
+      if (!text || typeof text !== 'string') return null;
+      const trimmed = text.trim();
+      if (!trimmed.startsWith('{')) return null;
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (parsed && parsed.action === 'book_appointment' && parsed.payload) {
+          return parsed;
+        }
+        return null;
+      } catch {
+        return null;
+      }
+    }
+
+    function isLikelyBookingJson(partialText) {
+      if (!partialText) return false;
+      const trimmed = partialText.trimStart();
+      // Heuristic: booking JSON will always start as a JSON object with an "action" field.
+      if (/"action"\s*:\s*"book_appointment"/.test(trimmed)) return true;
+      if (/^\s*\{\s*"action"\s*:/.test(trimmed)) return true;
+      if (trimmed.startsWith('{') && /"payload"\s*:\s*\{/.test(trimmed)) return true;
+      if (/book_appointment/.test(trimmed)) return true;
+      return false;
+    }
+
+    async function createBookingFromPayload(bookingAction) {
+      const payload = bookingAction && bookingAction.payload ? bookingAction.payload : null;
+      if (!payload) return null;
+
+      const {
+        name,
+        age,
+        contact_number: contactNumber,
+        medical_concern: medicalConcern,
+        appointment_datetime: appointmentDateTimeRaw,
+        email = null,
+        doctor_preference: doctorPreference = null,
+      } = payload;
+
+      if (!browserSessionId) {
+        throw new Error('Missing browserSessionId for booking');
+      }
+
+      if (!name || !contactNumber || !medicalConcern || !appointmentDateTimeRaw || typeof age !== 'number') {
+        throw new Error('Missing required booking fields');
+      }
+
+      let appointmentDate = new Date(appointmentDateTimeRaw);
+      if (Number.isNaN(appointmentDate.getTime())) {
+        throw new Error('Invalid appointment_datetime');
+      }
+
+      await connectToDatabase();
+
+      const booking = await Booking.create({
+        browserSessionId,
+        user: currentUserId || null,
+        name,
+        age,
+        contactNumber,
+        medicalConcern,
+        appointmentDateTime: appointmentDate,
+        email,
+        doctorPreference,
+        status: 'confirmed',
+      });
+
+      log('ws', 'booking_created', {
+        browserSessionId,
+        hasUser: !!currentUserId,
+        bookingId: booking._id.toString(),
+      });
+
+      return booking;
+    }
+
     /**
      * Process user message and make LLM call (used for both voice transcripts and chat messages)
      * @param {string} userMessage - The user's message text
@@ -154,9 +233,19 @@ function initWebSocketServer(server) {
       currentLLMStream = createOpenAIStream({
         messages: conversationHistory,
         onToken: (token) => {
-          // Stream tokens to frontend in real-time
           llmResponseText += token;
-          sendMessage('agent_text', { token });
+          // If this looks like a booking JSON payload, suppress streaming to UI
+          if (!suppressBookingStreaming && isLikelyBookingJson(llmResponseText)) {
+            suppressBookingStreaming = true;
+            // Clear any partial JSON that may have been sent
+            sendMessage('agent_text', { token: '', clear: true });
+            return;
+          }
+
+          if (!suppressBookingStreaming) {
+            // Stream tokens to frontend in real-time
+            sendMessage('agent_text', { token });
+          }
         },
         onComplete: async (fullResponse) => {
           llmResponseText = fullResponse;
@@ -164,7 +253,70 @@ function initWebSocketServer(server) {
           // Add assistant response to conversation history
           conversationHistory.push({ role: 'assistant', content: fullResponse });
 
-          // Persist conversation turn to database (guest or logged-in)
+          // Check if this is a booking action JSON
+          const bookingAction = parseBookingPayload(fullResponse);
+          if (bookingAction) {
+            try {
+              // Inform the user that booking is in progress
+              sendMessage('agent_text', { token: '', clear: true });
+              sendMessage('agent_text', {
+                token: 'Please wait, your appointment booking is in progress.',
+              });
+              sendMessage('status', { state: 'processing' });
+
+              const booking = await createBookingFromPayload(bookingAction);
+
+              // Clear progress text and send a friendly confirmation
+              sendMessage('agent_text', { token: '', clear: true });
+
+              const confirmationText =
+                'Your appointment has been successfully booked for the date and time you requested. Our team will share the details with you shortly.';
+              sendMessage('agent_text', { token: confirmationText });
+
+              // Persist conversation turn with the human-friendly confirmation text
+              await saveConversationTurn(
+                messageText,
+                confirmationText,
+                isChatMode ? 'chat' : 'voice'
+              );
+
+              // Also send structured pair for UI history
+              try {
+                const agentTimestamp = new Date().toISOString();
+                sendMessage('conversation_turn', {
+                  mode: isChatMode ? 'chat' : 'voice',
+                  user: {
+                    text: messageText,
+                    timestamp: userTimestamp,
+                  },
+                  agent: {
+                    text: confirmationText,
+                    timestamp: agentTimestamp,
+                  },
+                });
+              } catch (err) {
+                log('ws', 'conversation_turn_send_error', {
+                  error: err.message,
+                });
+              }
+            } catch (error) {
+              log('ws', 'booking_creation_error', { error: error.message });
+              sendMessage('agent_text', { token: '', clear: true });
+              sendMessage('agent_text', {
+                token:
+                  'I’m sorry, there was a problem booking your appointment. Please try again in a moment, or call +919970758021 to book instantly.',
+              });
+            } finally {
+              suppressBookingStreaming = false;
+            }
+
+            // For booking flows, skip normal status handling below
+            sendMessage('status', { state: 'idle' });
+            currentLLMStream = null;
+            return;
+          }
+
+          // Persist conversation turn to database (guest or logged-in) for normal responses
           await saveConversationTurn(
             messageText,
             fullResponse,
@@ -212,6 +364,7 @@ function initWebSocketServer(server) {
           });
 
           currentLLMStream = null;
+          suppressBookingStreaming = false;
         },
         onError: async (err) => {
           log('openai', 'llm_error', { error: err.message, isChatMode });
@@ -758,11 +911,86 @@ function initWebSocketServer(server) {
         messages: conversationHistory,
         onToken: (token) => {
           llmResponseForFile += token;
-          sendMessage('agent_text', { token });
+          // Re-use the same booking suppression logic for voice transcripts
+          if (!suppressBookingStreaming && isLikelyBookingJson(llmResponseForFile)) {
+            suppressBookingStreaming = true;
+            sendMessage('agent_text', { token: '', clear: true });
+            return;
+          }
+
+          if (!suppressBookingStreaming) {
+            sendMessage('agent_text', { token });
+          }
         },
         onComplete: async (fullText) => {
           llmResponseForFile = fullText;
           conversationHistory.push({ role: 'assistant', content: fullText });
+
+          const bookingAction = parseBookingPayload(fullText);
+          if (bookingAction) {
+            try {
+              sendMessage('agent_text', { token: '', clear: true });
+              sendMessage('agent_text', {
+                token: 'Please wait, your appointment booking is in progress.',
+              });
+              sendMessage('status', { state: 'processing' });
+
+              const booking = await createBookingFromPayload(bookingAction);
+
+              sendMessage('agent_text', { token: '', clear: true });
+
+              const confirmationText =
+                'Your appointment has been successfully booked for the date and time you requested. Our team will share the details with you shortly.';
+              sendMessage('agent_text', { token: confirmationText });
+
+              await saveConversationTurn(transcriptForFile, confirmationText, 'voice');
+
+              try {
+                const agentTimestamp = new Date().toISOString();
+                sendMessage('conversation_turn', {
+                  mode: 'voice',
+                  user: {
+                    text: transcriptForFile,
+                    timestamp: userTimestamp,
+                  },
+                  agent: {
+                    text: confirmationText,
+                    timestamp: agentTimestamp,
+                  },
+                });
+              } catch (err) {
+                log('ws', 'conversation_turn_send_error', {
+                  error: err.message,
+                });
+              }
+
+              // For voice mode, also speak the confirmation
+              sendMessage('status', { state: 'speaking' });
+              currentTTSStream = createTTSStream({
+                text: confirmationText,
+                onAudioChunk: (chunk) => {
+                  sendMessage('agent_audio', { audio: chunk.toString('base64') });
+                },
+                onEnd: () => {
+                  sendMessage('status', { state: 'idle' });
+                  currentTTSStream = null;
+                },
+              });
+            } catch (error) {
+              log('ws', 'booking_creation_error', { error: error.message });
+              sendMessage('agent_text', { token: '', clear: true });
+              const errorText =
+                'I’m sorry, there was a problem booking your appointment. Please try again in a moment, or call +919970758021 to book instantly.';
+              sendMessage('agent_text', { token: errorText });
+              await saveConversationTurn(transcriptForFile, errorText, 'voice');
+              sendMessage('status', { state: 'error', error: 'booking_failed' });
+            } finally {
+              suppressBookingStreaming = false;
+            }
+
+            currentLLMStream = null;
+            return;
+          }
 
           // Save transcript and LLM response to database with session id
           await saveConversationTurn(transcriptForFile, fullText, 'voice');
@@ -807,7 +1035,8 @@ function initWebSocketServer(server) {
           // Save transcript with error message
           const errorResponse = `Error: ${err.message}`;
           await saveConversationTurn(transcriptForFile, errorResponse, 'voice');
-          
+          suppressBookingStreaming = false;
+
           sendMessage('status', { state: 'error', error: 'llm_error' });
         },
       });
