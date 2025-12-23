@@ -1,10 +1,11 @@
 const WebSocket = require('ws');
-const fs = require('fs');
-const path = require('path');
 
 const { createDeepgramStream } = require('./services/deepgram');
 const { createOpenAIStream } = require('./services/openai');
 const { createTTSStream } = require('./services/tts');
+const { connectToDatabase } = require('./db');
+const Session = require('./models/Session');
+const ConversationEntry = require('./models/ConversationEntry');
 
 function log(context, message, extra = {}) {
   const timestamp = new Date().toISOString();
@@ -30,6 +31,7 @@ function initWebSocketServer(server) {
     let deepgramStream = null;
     let conversationHistory = [];
     let browserSessionId = null;
+    let currentUserId = null;
     let isRecording = false;
     
     // Silence detection for transcript finalization
@@ -53,29 +55,51 @@ function initWebSocketServer(server) {
       }
     }
 
-    function saveTranscriptToFile(transcript, llmResponse, sessionId) {
+    async function resolveUserForBrowserSession(id) {
       try {
-        const timestamp = new Date().toISOString();
-        const filePath = path.join(__dirname, 'transcripts.jsonl');
-        
-        const entry = {
-          timestamp,
-          transcript,
-          llm_response: llmResponse,
-          browser_session_id: sessionId || null,
-        };
-        
-        // Append to file (JSONL format - one JSON object per line)
-        fs.appendFileSync(filePath, JSON.stringify(entry) + '\n', 'utf8');
-        
-        log('ws', 'transcript_saved_to_file', {
-          filePath,
-          transcriptLength: transcript.length,
-          timestamp
+        await connectToDatabase();
+        const session = await Session.findOne({ browserSessionId: id })
+          .sort({ updatedAt: -1 })
+          .lean()
+          .exec();
+        currentUserId = session && session.user ? session.user.toString() : null;
+      } catch (error) {
+        log('ws', 'error_resolving_session_user', {
+          error: error.message,
+          browserSessionId: id,
+        });
+        currentUserId = null;
+      }
+    }
+
+    async function saveConversationTurn(userText, agentText, mode) {
+      try {
+        if (!browserSessionId) {
+          // Nothing to persist without a browser session identifier
+          return;
+        }
+
+        await connectToDatabase();
+
+        await ConversationEntry.create({
+          browserSessionId,
+          user: currentUserId || null,
+          mode,
+          userText,
+          agentText,
+        });
+
+        log('ws', 'conversation_turn_saved', {
+          browserSessionId,
+          hasUser: !!currentUserId,
+          mode,
+          userTextLength: userText.length,
+          agentTextLength: agentText.length,
         });
       } catch (error) {
-        log('ws', 'error_saving_transcript', {
-          error: error.message
+        log('ws', 'error_saving_conversation_turn', {
+          error: error.message,
+          browserSessionId,
         });
       }
     }
@@ -92,6 +116,7 @@ function initWebSocketServer(server) {
       }
 
       const messageText = userMessage.trim();
+      const userTimestamp = new Date().toISOString();
       
       log('ws', 'processing_user_message_for_llm', {
         messageLength: messageText.length,
@@ -133,14 +158,38 @@ function initWebSocketServer(server) {
           llmResponseText += token;
           sendMessage('agent_text', { token });
         },
-        onComplete: (fullResponse) => {
+        onComplete: async (fullResponse) => {
           llmResponseText = fullResponse;
 
           // Add assistant response to conversation history
           conversationHistory.push({ role: 'assistant', content: fullResponse });
 
-          // Save message and LLM response to file with session id
-          saveTranscriptToFile(messageText, fullResponse, browserSessionId);
+          // Persist conversation turn to database (guest or logged-in)
+          await saveConversationTurn(
+            messageText,
+            fullResponse,
+            isChatMode ? 'chat' : 'voice'
+          );
+
+          // Send structured pair of user + agent messages so UI can render both bubbles
+          try {
+            const agentTimestamp = new Date().toISOString();
+            sendMessage('conversation_turn', {
+              mode: isChatMode ? 'chat' : 'voice',
+              user: {
+                text: messageText,
+                timestamp: userTimestamp,
+              },
+              agent: {
+                text: fullResponse,
+                timestamp: agentTimestamp,
+              },
+            });
+          } catch (err) {
+            log('ws', 'conversation_turn_send_error', {
+              error: err.message,
+            });
+          }
 
           // Update status based on mode
           if (isChatMode) {
@@ -164,12 +213,16 @@ function initWebSocketServer(server) {
 
           currentLLMStream = null;
         },
-        onError: (err) => {
+        onError: async (err) => {
           log('openai', 'llm_error', { error: err.message, isChatMode });
 
-          // Save message with error response
+          // Persist error response as a conversation turn for debugging/traceability
           const errorResponse = `Error: ${err.message}`;
-          saveTranscriptToFile(messageText, errorResponse, browserSessionId);
+          await saveConversationTurn(
+            messageText,
+            errorResponse,
+            isChatMode ? 'chat' : 'voice'
+          );
 
           sendMessage('status', { state: 'error', error: 'llm_error' });
           currentLLMStream = null;
@@ -643,6 +696,7 @@ function initWebSocketServer(server) {
       }
 
       const finalText = pendingTranscript.trim();
+      const userTimestamp = new Date().toISOString();
       
       // Prevent duplicate finalizations of the same transcript
       if (lastFinalizedTranscript === finalText) {
@@ -696,7 +750,7 @@ function initWebSocketServer(server) {
       // Clear previous agent response in UI when new LLM call starts
       sendMessage('agent_text', { token: '', clear: true });
 
-      // Store transcript for saving to file
+      // Store transcript for saving to database
       const transcriptForFile = finalText;
       let llmResponseForFile = '';
 
@@ -706,12 +760,32 @@ function initWebSocketServer(server) {
           llmResponseForFile += token;
           sendMessage('agent_text', { token });
         },
-        onComplete: (fullText) => {
+        onComplete: async (fullText) => {
           llmResponseForFile = fullText;
           conversationHistory.push({ role: 'assistant', content: fullText });
 
-          // Save transcript and LLM response to file with session id
-          saveTranscriptToFile(transcriptForFile, fullText, browserSessionId);
+          // Save transcript and LLM response to database with session id
+          await saveConversationTurn(transcriptForFile, fullText, 'voice');
+
+          // Send structured pair of user + agent messages for voice mode
+          try {
+            const agentTimestamp = new Date().toISOString();
+            sendMessage('conversation_turn', {
+              mode: 'voice',
+              user: {
+                text: transcriptForFile,
+                timestamp: userTimestamp,
+              },
+              agent: {
+                text: fullText,
+                timestamp: agentTimestamp,
+              },
+            });
+          } catch (err) {
+            log('ws', 'conversation_turn_send_error', {
+              error: err.message,
+            });
+          }
 
           // Start TTS streaming for the final assistant text
           sendMessage('status', { state: 'speaking' });
@@ -727,12 +801,12 @@ function initWebSocketServer(server) {
             },
           });
         },
-        onError: (err) => {
+        onError: async (err) => {
           log('openai', 'llm_error', { error: err.message });
           
           // Save transcript with error message
           const errorResponse = `Error: ${err.message}`;
-          saveTranscriptToFile(transcriptForFile, errorResponse, browserSessionId);
+          await saveConversationTurn(transcriptForFile, errorResponse, 'voice');
           
           sendMessage('status', { state: 'error', error: 'llm_error' });
         },
@@ -762,7 +836,7 @@ function initWebSocketServer(server) {
       lastSentTranscript = null;
     }
 
-    ws.on('message', (data) => {
+    ws.on('message', async (data) => {
       try {
         let parsed;
         if (typeof data === 'string') {
@@ -775,6 +849,7 @@ function initWebSocketServer(server) {
 
         if (metadata && metadata.browser_session_id && !browserSessionId) {
           browserSessionId = String(metadata.browser_session_id);
+          await resolveUserForBrowserSession(browserSessionId);
         }
 
         switch (type) {
