@@ -8,6 +8,7 @@ const Session = require('./models/Session');
 const ConversationEntry = require('./models/ConversationEntry');
 const Booking = require('./models/Booking');
 const { sendAppointmentConfirmationEmail } = require('./services/emailService');
+const { scheduleMeeting, formatAppointmentDateTime } = require('./services/googleCalendar');
 
 function log(context, message, extra = {}) {
   const timestamp = new Date().toISOString();
@@ -34,6 +35,7 @@ function initWebSocketServer(server) {
     let conversationHistory = [];
     let browserSessionId = null;
     let currentUserId = null;
+    let userTimezone = 'Asia/Kolkata'; // Default timezone, will be updated from metadata
     let isRecording = false;
     let suppressBookingStreaming = false;
     
@@ -146,9 +148,10 @@ function initWebSocketServer(server) {
      * Create a booking from the booking action payload
      * @param {Object} bookingAction - The booking action object with payload
      * @param {Function} onEmailSuccess - Optional callback called when email is sent successfully
+     * @param {Function} onCalendarSuccess - Optional callback called when calendar meeting is scheduled successfully
      * @returns {Promise<Object>} The created booking object
      */
-    async function createBookingFromPayload(bookingAction, onEmailSuccess = null) {
+    async function createBookingFromPayload(bookingAction, onEmailSuccess = null, onCalendarSuccess = null) {
       const payload = bookingAction && bookingAction.payload ? bookingAction.payload : null;
       if (!payload) return null;
 
@@ -196,8 +199,7 @@ function initWebSocketServer(server) {
         bookingId: booking._id.toString(),
       });
 
-      // Send confirmation email if email is provided
-      // This runs asynchronously and does not block the booking creation
+      // Send confirmation email and schedule calendar meeting if email is provided
       if (email && typeof email === 'string' && email.trim().length > 0) {
         // Convert booking document to plain object for email service
         const bookingData = {
@@ -210,22 +212,103 @@ function initWebSocketServer(server) {
           doctorPreference: booking.doctorPreference || null,
         };
 
-        // Send email asynchronously - don't await to avoid blocking
-        sendAppointmentConfirmationEmail(bookingData)
-          .then(() => {
+        // Send email first, then schedule calendar meeting
+        // Run asynchronously to avoid blocking the booking response
+        (async () => {
+          try {
+            // Send email first - await to ensure it succeeds before scheduling calendar
+            await sendAppointmentConfirmationEmail(bookingData);
+
             // Email sent successfully - call callback if provided
             if (onEmailSuccess && typeof onEmailSuccess === 'function') {
               onEmailSuccess();
             }
-          })
-          .catch((emailError) => {
+
+            // Only schedule calendar meeting if email was sent successfully
+            try {
+              log('ws', 'attempting_calendar_schedule', {
+                bookingId: booking._id.toString(),
+                appointmentDateTime: booking.appointmentDateTime,
+                email: email,
+              });
+
+              // Format appointment datetime for Google Calendar (use current year, add 30 mins)
+              // Use user's timezone from metadata, fallback to Asia/Kolkata
+              const { startDateTime, endDateTime } = formatAppointmentDateTime(
+                booking.appointmentDateTime,
+                userTimezone || 'Asia/Kolkata'
+              );
+
+              log('ws', 'formatted_datetime_for_calendar', {
+                startDateTime,
+                endDateTime,
+              });
+
+              // Create event summary and description (matching email template style)
+              const eventSummary = `Hospital Appointment - ${booking.name}`;
+              const eventDescription = [
+                `Hospital Appointment Confirmation`,
+                ``,
+                `Patient Details:`,
+                `Patient Name: ${booking.name}`,
+                `Age: ${booking.age}`,
+                `Contact Number: ${booking.contactNumber}`,
+                ``,
+                `Appointment Details:`,
+                `Medical Concern: ${booking.medicalConcern}`,
+                booking.doctorPreference ? `Preferred Doctor: ${booking.doctorPreference}` : null,
+                ``,
+                `Please arrive 10-15 minutes before your scheduled appointment time.`,
+                ``,
+                `Best regards,`,
+                `Hospital Appointments Team`,
+              ]
+                .filter(Boolean)
+                .join('\n');
+
+              // Schedule calendar meeting with patient email as attendee
+              // Use user's timezone from metadata, fallback to Asia/Kolkata
+              const calendarResult = await scheduleMeeting({
+                summary: eventSummary,
+                description: eventDescription,
+                startDateTime,
+                endDateTime,
+                timezone: userTimezone || 'Asia/Kolkata',
+                calendarId: 'primary',
+                attendees: [email], // Add patient email as attendee
+              });
+
+              log('ws', 'calendar_meeting_scheduled', {
+                bookingId: booking._id.toString(),
+                eventId: calendarResult.eventId,
+                meetingLink: calendarResult.meetingLink,
+                start: calendarResult.start,
+                end: calendarResult.end,
+              });
+
+              // Send success message to user if callback provided
+              if (onCalendarSuccess && typeof onCalendarSuccess === 'function') {
+                onCalendarSuccess(calendarResult);
+              }
+            } catch (calendarError) {
+              // Log calendar error but don't fail the booking (email was sent successfully)
+              log('ws', 'calendar_schedule_failed', {
+                bookingId: booking._id.toString(),
+                email: email,
+                error: calendarError.message || String(calendarError),
+                stack: calendarError.stack,
+              });
+            }
+          } catch (emailError) {
             // Log email error but don't fail the booking
             log('ws', 'email_send_failed', {
               bookingId: booking._id.toString(),
               email: email,
               error: emailError.message,
             });
-          });
+            // Don't schedule calendar meeting if email failed
+          }
+        })();
       }
 
       return booking;
@@ -341,7 +424,19 @@ function initWebSocketServer(server) {
                 sendMessage('agent_text', { token: emailConfirmationText });
               };
 
-              const booking = await createBookingFromPayload(bookingAction, hasEmail ? onEmailSuccess : null);
+              // Callback to send calendar meeting confirmation when calendar is scheduled successfully
+              const onCalendarSuccess = (calendarResult) => {
+                const calendarConfirmationText = 'Great! I\'ve also scheduled your appointment in your calendar. You should receive a calendar invite with all the details and a Google Meet link.';
+                // Clear current agent text and start a new separate message
+                sendMessage('agent_text', { token: '', clear: true });
+                sendMessage('agent_text', { token: calendarConfirmationText });
+              };
+
+              const booking = await createBookingFromPayload(
+                bookingAction, 
+                hasEmail ? onEmailSuccess : null,
+                hasEmail ? onCalendarSuccess : null
+              );
 
               // Clear progress text and send a friendly confirmation
               sendMessage('agent_text', { token: '', clear: true });
@@ -1033,7 +1128,19 @@ function initWebSocketServer(server) {
                 sendMessage('agent_text', { token: emailConfirmationText });
               };
 
-              const booking = await createBookingFromPayload(bookingAction, hasEmail ? onEmailSuccess : null);
+              // Callback to send calendar meeting confirmation when calendar is scheduled successfully
+              const onCalendarSuccess = (calendarResult) => {
+                const calendarConfirmationText = 'Great! I\'ve also scheduled your appointment in your calendar. You should receive a calendar invite with all the details and a Google Meet link.';
+                // Clear current agent text and start a new separate message
+                sendMessage('agent_text', { token: '', clear: true });
+                sendMessage('agent_text', { token: calendarConfirmationText });
+              };
+
+              const booking = await createBookingFromPayload(
+                bookingAction, 
+                hasEmail ? onEmailSuccess : null,
+                hasEmail ? onCalendarSuccess : null
+              );
 
               sendMessage('agent_text', { token: '', clear: true });
 
@@ -1180,6 +1287,11 @@ function initWebSocketServer(server) {
         if (metadata && metadata.browser_session_id && !browserSessionId) {
           browserSessionId = String(metadata.browser_session_id);
           await resolveUserForBrowserSession(browserSessionId);
+        }
+
+        // Extract and store user timezone from metadata
+        if (metadata && metadata.timezone) {
+          userTimezone = String(metadata.timezone);
         }
 
         switch (type) {

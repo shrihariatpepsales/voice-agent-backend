@@ -4,10 +4,12 @@ const express = require('express');
 const http = require('http');
 const cors = require('cors');
 const authRoutes = require('./routes/auth');
+const calendarRoutes = require('./routes/calendar');
 const { connectToDatabase } = require('./db');
 const ConversationEntry = require('./models/ConversationEntry');
 const Booking = require('./models/Booking');
 const { sendAppointmentConfirmationEmail } = require('./services/emailService');
+const { scheduleMeeting, formatAppointmentDateTime } = require('./services/googleCalendar');
 
 const { initWebSocketServer } = require('./websocket');
 
@@ -23,6 +25,10 @@ app.get('/health', (req, res) => {
 
 // Auth routes (login/signup with email or phone)
 app.use('/api/auth', authRoutes);
+// Google OAuth routes (mounted at /auth for OAuth redirect compatibility)
+app.use('/auth', authRoutes);
+// Calendar routes (Google Calendar meeting scheduling)
+app.use('/', calendarRoutes);
 
 // Get conversation history for a browser session
 app.get('/api/conversations/:sessionId', async (req, res) => {
@@ -112,6 +118,9 @@ app.post('/book-appointment', async (req, res) => {
       return res.status(400).json({ error: 'browser_session_id is required in metadata' });
     }
 
+    // Extract user timezone from metadata, fallback to Asia/Kolkata
+    const userTimezone = (metadata && metadata.timezone) || 'Asia/Kolkata';
+
     let appointmentDate;
     try {
       appointmentDate = new Date(appointmentDateTimeRaw);
@@ -137,8 +146,7 @@ app.post('/book-appointment', async (req, res) => {
       status: 'confirmed',
     });
 
-    // Send confirmation email if email is provided
-    // This runs asynchronously and does not block the API response
+    // Send confirmation email and schedule calendar meeting if email is provided
     if (email && typeof email === 'string' && email.trim().length > 0) {
       // Convert booking document to plain object for email service
       const bookingData = {
@@ -151,15 +159,89 @@ app.post('/book-appointment', async (req, res) => {
         doctorPreference: booking.doctorPreference || null,
       };
 
-      // Send email asynchronously - don't await to avoid blocking the response
-      sendAppointmentConfirmationEmail(bookingData).catch((emailError) => {
+      try {
+        // Send email first - await to ensure it succeeds before scheduling calendar
+        await sendAppointmentConfirmationEmail(bookingData);
+
+        // Only schedule calendar meeting if email was sent successfully
+        try {
+          console.log('[server] Attempting to schedule calendar meeting...', {
+            bookingId: booking._id.toString(),
+            appointmentDateTime: booking.appointmentDateTime,
+            email: email,
+          });
+
+          // Format appointment datetime for Google Calendar (use current year, add 30 mins)
+          // Use user's timezone from metadata, fallback to Asia/Kolkata
+          const { startDateTime, endDateTime } = formatAppointmentDateTime(
+            booking.appointmentDateTime,
+            userTimezone
+          );
+
+          console.log('[server] Formatted datetime for calendar:', {
+            startDateTime,
+            endDateTime,
+          });
+
+          // Create event summary and description (matching email template style)
+          const eventSummary = `Hospital Appointment - ${booking.name}`;
+          const eventDescription = [
+            `Hospital Appointment Confirmation`,
+            ``,
+            `Patient Details:`,
+            `Patient Name: ${booking.name}`,
+            `Age: ${booking.age}`,
+            `Contact Number: ${booking.contactNumber}`,
+            ``,
+            `Appointment Details:`,
+            `Medical Concern: ${booking.medicalConcern}`,
+            booking.doctorPreference ? `Preferred Doctor: ${booking.doctorPreference}` : null,
+            ``,
+            `Please arrive 10-15 minutes before your scheduled appointment time.`,
+            ``,
+            `Best regards,`,
+            `Hospital Appointments Team`,
+          ]
+            .filter(Boolean)
+            .join('\n');
+
+          // Schedule calendar meeting with patient email as attendee
+          // Use user's timezone from metadata, fallback to Asia/Kolkata
+          const calendarResult = await scheduleMeeting({
+            summary: eventSummary,
+            description: eventDescription,
+            startDateTime,
+            endDateTime,
+            timezone: userTimezone,
+            calendarId: 'primary',
+            attendees: [email], // Add patient email as attendee
+          });
+
+          console.log('[server] Calendar meeting scheduled successfully', {
+            bookingId: booking._id.toString(),
+            eventId: calendarResult.eventId,
+            meetingLink: calendarResult.meetingLink,
+            start: calendarResult.start,
+            end: calendarResult.end,
+          });
+        } catch (calendarError) {
+          // Log calendar error with full details but don't fail the booking (email was sent successfully)
+          console.error('[server] Failed to schedule calendar meeting (booking and email still successful)', {
+            bookingId: booking._id.toString(),
+            email: email,
+            error: calendarError.message || String(calendarError),
+            stack: calendarError.stack,
+          });
+        }
+      } catch (emailError) {
         // Log email error but don't fail the booking
         console.error('[server] Failed to send confirmation email (booking still successful)', {
           bookingId: booking._id.toString(),
           email: email,
           error: emailError.message,
         });
-      });
+        // Don't schedule calendar meeting if email failed
+      }
     }
 
     return res.status(200).json({

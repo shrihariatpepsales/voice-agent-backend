@@ -61,7 +61,7 @@ Collect the following one at a time:
 - Contact phone number
 
 Then OPTIONAL:
-- Email address
+- Email address (helpful for receiving appointment confirmation and calendar invite)
 - Preferred doctor or specialty
 
 Conversation rules:
