@@ -57,6 +57,15 @@ function initWebSocketServer(server) {
       }
     }
 
+    /**
+     * Check if text contains curly braces (opening or closing).
+     * Used to filter out JSON fragments or malformed responses before sending to frontend.
+     */
+    function containsCurlyBraces(text) {
+      if (!text || typeof text !== 'string') return false;
+      return text.includes('{') || text.includes('}');
+    }
+
     async function resolveUserForBrowserSession(id) {
       try {
         await connectToDatabase();
@@ -243,8 +252,11 @@ function initWebSocketServer(server) {
           }
 
           if (!suppressBookingStreaming) {
-            // Stream tokens to frontend in real-time
-            sendMessage('agent_text', { token });
+            // Filter out tokens containing curly braces to prevent JSON fragments from appearing
+            if (!containsCurlyBraces(token)) {
+              // Stream tokens to frontend in real-time
+              sendMessage('agent_text', { token });
+            }
           }
         },
         onComplete: async (fullResponse) => {
@@ -323,6 +335,9 @@ function initWebSocketServer(server) {
             isChatMode ? 'chat' : 'voice'
           );
 
+          // Filter out responses containing curly braces before sending to UI
+          const sanitizedResponse = containsCurlyBraces(fullResponse) ? '' : fullResponse;
+
           // Send structured pair of user + agent messages so UI can render both bubbles
           try {
             const agentTimestamp = new Date().toISOString();
@@ -333,7 +348,7 @@ function initWebSocketServer(server) {
                 timestamp: userTimestamp,
               },
               agent: {
-                text: fullResponse,
+                text: sanitizedResponse,
                 timestamp: agentTimestamp,
               },
             });
@@ -919,7 +934,10 @@ function initWebSocketServer(server) {
           }
 
           if (!suppressBookingStreaming) {
-            sendMessage('agent_text', { token });
+            // Filter out tokens containing curly braces to prevent JSON fragments from appearing
+            if (!containsCurlyBraces(token)) {
+              sendMessage('agent_text', { token });
+            }
           }
         },
         onComplete: async (fullText) => {
@@ -992,6 +1010,9 @@ function initWebSocketServer(server) {
             return;
           }
 
+          // Filter out responses containing curly braces before sending to UI
+          const sanitizedResponse = containsCurlyBraces(fullText) ? '' : fullText;
+
           // Save transcript and LLM response to database with session id
           await saveConversationTurn(transcriptForFile, fullText, 'voice');
 
@@ -1005,7 +1026,7 @@ function initWebSocketServer(server) {
                 timestamp: userTimestamp,
               },
               agent: {
-                text: fullText,
+                text: sanitizedResponse,
                 timestamp: agentTimestamp,
               },
             });

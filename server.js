@@ -40,14 +40,27 @@ app.get('/api/conversations/:sessionId', async (req, res) => {
       .lean()
       .exec();
 
-    const entries = docs.map((doc) => ({
-      timestamp: doc.createdAt.toISOString(),
-      transcript: doc.userText,
-      llm_response: doc.agentText,
-      browser_session_id: doc.browserSessionId,
-      mode: doc.mode,
-      user_id: doc.user ? doc.user.toString() : null,
-    }));
+    /**
+     * Check if text contains curly braces (opening or closing).
+     * Used to filter out JSON fragments or malformed responses before sending to frontend.
+     */
+    function containsCurlyBraces(text) {
+      if (!text || typeof text !== 'string') return false;
+      return text.includes('{') || text.includes('}');
+    }
+
+    const entries = docs.map((doc) => {
+      // Filter out agent responses containing curly braces before returning to frontend
+      const sanitizedAgentText = containsCurlyBraces(doc.agentText) ? '' : doc.agentText;
+      return {
+        timestamp: doc.createdAt.toISOString(),
+        transcript: doc.userText,
+        llm_response: sanitizedAgentText,
+        browser_session_id: doc.browserSessionId,
+        mode: doc.mode,
+        user_id: doc.user ? doc.user.toString() : null,
+      };
+    });
 
     return res.json({ session_id: sessionId, entries });
   } catch (err) {
