@@ -78,6 +78,109 @@ function initWebSocketServer(server) {
       }
     }
 
+    /**
+     * Process user message and make LLM call (used for both voice transcripts and chat messages)
+     * @param {string} userMessage - The user's message text
+     * @param {boolean} isChatMode - Whether this is from chat mode (affects status updates)
+     */
+    function processUserMessage(userMessage, isChatMode = false) {
+      if (!userMessage || !userMessage.trim()) {
+        log('ws', 'empty_user_message', { isChatMode });
+        return;
+      }
+
+      const messageText = userMessage.trim();
+      
+      log('ws', 'processing_user_message_for_llm', {
+        messageLength: messageText.length,
+        messagePreview: messageText.substring(0, 100),
+        isChatMode
+      });
+
+      // Print "Make LLM call" to console
+      console.log('\n========================================');
+      console.log('🔔 Make LLM call');
+      console.log(`📝 ${isChatMode ? 'Chat' : 'Transcript'}: ${messageText}`);
+      console.log('========================================\n');
+
+      // Add user message to conversation history
+      conversationHistory.push({ role: 'user', content: messageText });
+
+      // Update status to show we're thinking
+      sendMessage('status', { state: 'thinking' });
+
+      // Clear previous agent response in UI when new LLM call starts
+      sendMessage('agent_text', { token: '', clear: true });
+
+      // Cancel any in-flight LLM/TTS streams
+      if (currentLLMStream && currentLLMStream.cancel) {
+        currentLLMStream.cancel();
+        currentLLMStream = null;
+      }
+      if (currentTTSStream && currentTTSStream.cancel) {
+        currentTTSStream.cancel();
+        currentTTSStream = null;
+      }
+
+      // Create OpenAI stream for LLM response
+      let llmResponseText = '';
+      currentLLMStream = createOpenAIStream({
+        messages: conversationHistory,
+        onToken: (token) => {
+          // Stream tokens to frontend in real-time
+          llmResponseText += token;
+          sendMessage('agent_text', { token });
+        },
+        onComplete: (fullResponse) => {
+          llmResponseText = fullResponse;
+
+          // Add assistant response to conversation history
+          conversationHistory.push({ role: 'assistant', content: fullResponse });
+
+          // Save message and LLM response to file
+          saveTranscriptToFile(messageText, fullResponse);
+
+          // Update status based on mode
+          if (isChatMode) {
+            // In chat mode, skip 'speaking' status and go directly to 'idle'
+            // (No TTS in chat mode)
+            sendMessage('status', { state: 'idle' });
+          } else {
+            // In voice mode, set 'speaking' status for TTS indication
+            // Frontend will handle TTS and update state accordingly
+            sendMessage('status', { state: 'speaking' });
+            // Set to idle to trigger frontend TTS
+            sendMessage('status', { state: 'idle' });
+          }
+
+          // Log completion
+          log('ws', 'llm_response_complete', {
+            messageLength: messageText.length,
+            responseLength: fullResponse.length,
+            isChatMode
+          });
+
+          currentLLMStream = null;
+        },
+        onError: (err) => {
+          log('openai', 'llm_error', { error: err.message, isChatMode });
+
+          // Save message with error response
+          const errorResponse = `Error: ${err.message}`;
+          saveTranscriptToFile(messageText, errorResponse);
+
+          sendMessage('status', { state: 'error', error: 'llm_error' });
+          currentLLMStream = null;
+        },
+      });
+
+      log('ws', 'llm_call_initiated', {
+        messageLength: messageText.length,
+        conversationHistoryLength: conversationHistory.length,
+        isChatMode
+      });
+    }
+
     function startDeepgramStream() {
       if (deepgramStream) {
         // Already started
@@ -379,96 +482,17 @@ function initWebSocketServer(server) {
                 receivedFinalFromDeepgram: receivedFinalTranscript
               });
               
-              // Print "Make LLM call" to console as requested
-              console.log('\n========================================');
-              console.log('🔔 Make LLM call');
-              console.log(`📝 Transcript: ${transcriptToProcess}`);
-              console.log('========================================\n');
+              // Use the shared processUserMessage function for voice transcripts
+            processUserMessage(transcriptToProcess, false);
             
-            // Add user message to conversation history
-            conversationHistory.push({ role: 'user', content: transcriptToProcess });
+            // Reset transcript immediately after LLM call is initiated
+            // This ensures we start fresh for the next utterance
+            pendingTranscript = null;
+            lastSentTranscript = null;
+            receivedFinalTranscript = false;
             
-            // Update status to show we're thinking
-            sendMessage('status', { state: 'thinking' });
-            
-            // Clear previous agent response in UI when new LLM call starts
-            sendMessage('agent_text', { token: '', clear: true });
-            
-            // Cancel any in-flight LLM/TTS streams
-            if (currentLLMStream && currentLLMStream.cancel) {
-              currentLLMStream.cancel();
-              currentLLMStream = null;
-            }
-            if (currentTTSStream && currentTTSStream.cancel) {
-              currentTTSStream.cancel();
-              currentTTSStream = null;
-            }
-            
-            // Create OpenAI stream for LLM response
-            let llmResponseText = '';
-            currentLLMStream = createOpenAIStream({
-              messages: conversationHistory,
-              onToken: (token) => {
-                // Stream tokens to frontend in real-time
-                llmResponseText += token;
-                sendMessage('agent_text', { token });
-              },
-              onComplete: (fullResponse) => {
-                llmResponseText = fullResponse;
-                
-                // Add assistant response to conversation history
-                conversationHistory.push({ role: 'assistant', content: fullResponse });
-                
-                // Save transcript and LLM response to file
-                saveTranscriptToFile(transcriptToProcess, fullResponse);
-                
-                // Update status to speaking (for TTS if implemented)
-                sendMessage('status', { state: 'speaking' });
-                
-                // Log completion
-                log('ws', 'llm_response_complete', {
-                  transcriptLength: transcriptToProcess.length,
-                  responseLength: fullResponse.length
-                });
-                
-                // Reset transcript immediately after LLM call completes
-                // This ensures we start fresh for the next utterance
-                pendingTranscript = null;
-                lastSentTranscript = null;
-                receivedFinalTranscript = false;
-                
-                // Reset flag to allow next LLM call immediately
-                llmCallPending = false;
-                
-                // Update status to idle after response
-                sendMessage('status', { state: 'idle' });
-                
-                currentLLMStream = null;
-              },
-              onError: (err) => {
-                log('openai', 'llm_error', { error: err.message });
-                
-                // Save transcript with error message
-                const errorResponse = `Error: ${err.message}`;
-                saveTranscriptToFile(transcriptToProcess, errorResponse);
-                
-                sendMessage('status', { state: 'error', error: 'llm_error' });
-                currentLLMStream = null;
-                
-                // Reset transcript even on error
-                pendingTranscript = null;
-                lastSentTranscript = null;
-                
-                // Reset flags to allow next LLM call
-                llmCallPending = false;
-                receivedFinalTranscript = false;
-              },
-            });
-            
-            log('ws', 'llm_call_initiated', {
-              transcriptLength: transcriptToProcess.length,
-              conversationHistoryLength: conversationHistory.length
-            });
+            // Reset flag to allow next LLM call immediately
+            llmCallPending = false;
             } else {
               // No transcript to process - reset flag
               log('ws', 'no_transcript_to_process', {
@@ -793,6 +817,16 @@ function initWebSocketServer(server) {
             currentLLMStream = null;
             currentTTSStream = null;
             sendMessage('status', { state: 'interrupted' });
+            break;
+          }
+          case 'chat_message': {
+            log('ws', 'chat_message_received', { 
+              textLength: payload?.text?.length || 0 
+            });
+            if (payload && payload.text && payload.text.trim()) {
+              // Process chat message immediately (no silence detection needed)
+              processUserMessage(payload.text, true);
+            }
             break;
           }
           default: {
