@@ -6,7 +6,7 @@
 require('dotenv').config();
 
 async function testScheduleMeeting() {
-  const baseUrl = process.env.API_URL || 'http://localhost:3001';
+  const baseUrl = process.env.VITE_API_URL || 'http://localhost:3001';
 
   try {
     console.log('Testing POST /schedule-meeting endpoint...\n');
